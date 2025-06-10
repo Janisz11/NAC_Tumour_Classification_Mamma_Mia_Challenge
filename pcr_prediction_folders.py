@@ -33,10 +33,10 @@ def crop_breast_containing_mask(image_stack, mask):
     if coords.size == 0:
         return image_stack, mask # Pacjentka bez raka
 
-    center_x = coords[2].mean() 
+    center_x = coords[1].mean() 
     
     # całkowity rozmiar obrazu w osi X
-    full_x_dim = image_stack.shape[3]
+    full_x_dim = image_stack.shape[2]
     
     # środek obrazu w osi X
     mid_x = full_x_dim / 2
@@ -122,8 +122,7 @@ for pid in os.listdir(IMG_DIR):
         
         #Jezeli duke to przycinamy do jednej piersi
         if is_duke_patient:
-            full_breast_image_to_save, full_breast_mask_to_save = 
-                crop_breast_containing_mask(image_stack_original.copy(), seg_np.copy())
+            full_breast_image_to_save, full_breast_mask_to_save = crop_breast_containing_mask(image_stack_original.copy(), seg_np.copy())
             
             
         # Zapis do podfolderu
@@ -134,6 +133,7 @@ for pid in os.listdir(IMG_DIR):
         
         # Dodanie info do JSON
         data_entry["full_breast_path"] = os.path.join(pid, "full_breast")
+        data_entry["is_duke"] = is_duke_patient
         data_entry["full_breast_num_phases"] = full_breast_image_to_save.shape[0]
         data_entry["full_breast_shape"] = full_breast_image_to_save.shape[1:]
         data_entry["full_breast_mask_shape"] = full_breast_mask_to_save.shape
