@@ -49,7 +49,7 @@ def crop_breast_containing_mask(image_stack, mask):
     
     # Przycinanie dla wszystkich faz
     cropped_image_stack = image_stack[:, :, :, slices_x]
-    cropped_mask = mask[:, :, slices_x] # WAŻNE: Maska też musi być przycięta!
+    cropped_mask = mask[:, :, slices_x] 
     
     return cropped_image_stack, cropped_mask
 
