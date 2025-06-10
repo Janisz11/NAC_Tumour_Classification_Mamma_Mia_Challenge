@@ -85,7 +85,7 @@ for pid in os.listdir(IMG_DIR):
     if len(image_array_list) == 0:
         continue
 
-    # 2. Maska - ekspert
+    # Maska - ekspert
     seg_path  = os.path.join(SEG_EXPERT_DIR, f"{pid_lower}.nii.gz")
     if not os.path.exists(seg_path):
         continue
@@ -138,13 +138,13 @@ for pid in os.listdir(IMG_DIR):
         data_entry["full_breast_shape"] = full_breast_image_to_save.shape[1:]
         data_entry["full_breast_mask_shape"] = full_breast_mask_to_save.shape
 
-    #Dodanie podfolderu ze zdeciami przycietymi do obszaru guza
+    # Dodanie podfolderu ze zdjeciami przycietymi do obszaru guza
     if CROP_WITH_MARGIN:
-        cropped_image_stack, cropped_seg_np = crop_to_bbox(image_stack_original.copy(), seg_np.copy(),          margin=MARGIN_SIZE)
+        cropped_image_stack, cropped_seg_np = crop_to_bbox(image_stack_original.copy(), seg_np.copy(),margin=MARGIN_SIZE)
         
         # Różnice między fazami
         if USE_DIFFS and cropped_image_stack.shape[0] > 1:
-            diffs_cropped = [cropped_image_stack[i+1] - cropped_image_stack[i] for i in        range(cropped_image_stack.shape[0]-1)]
+            diffs_cropped = [cropped_image_stack[i+1] - cropped_image_stack[i] for i in range(cropped_image_stack.shape[0]-1)]
             cropped_image_stack = np.concatenate((cropped_image_stack, np.stack(diffs_cropped, axis=0)), axis=0)
 
         # Zapis do podfolderu
