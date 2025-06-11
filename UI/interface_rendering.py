@@ -27,7 +27,7 @@ class BreastCancerApp:
     )
 
     from ai_assistant import (
-        send_message
+        predict_pcr
     )
 
     def init_ui(self):
@@ -162,7 +162,7 @@ class BreastCancerApp:
         self.user_input.pack(side="left", fill="x", expand=True, padx=(0, 5))
         self.user_input.bind("<Return>", self.send_message)
 
-        ttk.Button(bottom_frame, text="Wyślij", command=self.send_message).pack(side="right")
+        ttk.Button(bottom_frame, text="Wyślij", command=self.predict_pcr).pack(side="right")
 
 
         self.show_dataset_section()

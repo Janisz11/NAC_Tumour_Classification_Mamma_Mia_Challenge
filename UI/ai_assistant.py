@@ -1,48 +1,97 @@
+from fastapi import FastAPI, HTTPException
+import pandas as pd
+import joblib
 import openai
+import json
+import constants
 
-api_key = ("sk-proj-6E8eaLEQ8WQei5fEJ19AFq7YBwslsiCAVDaXgKv0LksPL33zk5sfwKwg9HYTWSjFfVOYnsOwPf"
-           "T3BlbkFJYZY_6BRHrQAjcQh4SeWYww8i-CRix45P8q75XyHMZAz2yQgW9_QyfqTM-ehKYISzpckygr0pUA")
+# === Konfiguracja OpenAI API ===
+# Ustaw swój klucz API tutaj (wklej z https://platform.openai.com/account/api-keys)
+openai.api_key = "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"
 
-client = openai.OpenAI(api_key=api_key)
+# === Wczytanie modelu ===
+MODEL_PATH = constants.models_folder_path + "\\xgb_model.pkl"
+model = joblib.load(MODEL_PATH)
 
-models = client.models.list()
+# === Załaduj kolumny oczekiwane przez model ===
+CLINICAL_XLSX = constants.project_root_folder + "\\clinical_and_imaging_info.xlsx"
+columns_to_drop = [
+    'patient_id', 'dataset',
+    'acquisition_times', 'mastectomy_post_nac', 'days_to_follow_up', 'days_to_recurrence',
+    'days_to_metastasis', 'days_to_death',
+]
+df = pd.read_excel(CLINICAL_XLSX)
+df = df.drop(columns=columns_to_drop, errors='ignore')
+df = df[df["pcr"].notna()]
+EXPECTED_COLUMNS = df.drop(columns=["pcr"]).columns.tolist()
 
-for model in models.data:
-    print(model.id)
+# === FastAPI app ===
+app = FastAPI()
 
-def send_message(self, event=None):
-    user_text = self.user_input.get().strip()
-    if not user_text:
-        return
 
-    self.chat_display.insert("end", f"Ty: {user_text}\n")
+# === Prompt dla GPT (po angielsku) ===
+GPT_PROMPT = """
+Extract clinical data from the patient's description below.
+Return the result in clean JSON format, without comments or explanation.
+
+Required fields:
+- age: integer
+- her2: 0 or 1
+- er: 0 or 1
+- pr: 0 or 1
+- menopause: "pre" or "post"
+- tumor_subtype: string
+- therapy: list of strings (e.g. ["anthracycline", "taxane"])
+
+Patient text:
+"""
+
+# === Endpoint do predykcji ===
+@app.post("/predict_pcr")
+def predict_pcr(self):
+    input_data = self.user_input.get().strip()
+
+    self.chat_display.insert("end", f"Ty: {input_data}\n")
     self.user_input.delete(0, "end")
 
-    self.assistant_messages.append({"role": "user", "content": user_text})
-
+    # 1. Wywołanie GPT-4
     try:
-        response = client.chat.completions.create(
+        completion = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=self.assistant_messages,
-            temperature=0.2
+            messages=[
+                {"role": "system", "content": "You are a medical assistant helping an oncologist."},
+                {"role": "user", "content": GPT_PROMPT + input_data}
+            ]
         )
-        assistant_reply = response.choices[0].message.content
-        assistant_reply = response.choices[0].message.content
-        self.chat_display.insert("end", f"Asystent: {assistant_reply}\n\n")
-        self.chat_display.see("end")
-
-        self.assistant_messages.append({"role": "assistant", "content": assistant_reply})
-
-        if "load_patient_data" in assistant_reply:
-            import re
-            match = re.search(r"load_patient_data\((.*?)\)", assistant_reply)
-            if match:
-                patient_id = match.group(1).strip().strip("'\"")
-                self.load_patient_data(patient_id)
-
+        extracted_json = completion.choices[0].message['content']
+        patient_dict = json.loads(extracted_json)
+        patient_data = pd.DataFrame([patient_dict])
     except Exception as e:
-        self.chat_display.insert("end", f"Błąd: {str(e)}\n\n")
+        raise HTTPException(status_code=500, detail=f"Error during GPT extraction or JSON parsing: {str(e)}")
 
+    # 2. Dopasuj brakujące kolumny jako NaN (ale nie zwracaj błędu)
+    missing_cols = [col for col in EXPECTED_COLUMNS if col not in patient_data.columns]
+    for col in EXPECTED_COLUMNS:
+        if col not in patient_data.columns:
+            patient_data[col] = pd.NA
+    patient_data = patient_data[EXPECTED_COLUMNS]
 
-def load_patient_data(self, patient_id):
-    self.chat_display.insert("end", f"[system] Załadowano dane pacjenta {patient_id}\n\n")
+    # 3. Predykcja modelem
+    try:
+        prediction = model.predict(patient_data)[0]
+        response = {
+            "prediction": int(prediction),
+            "model_used": "XGBoost",
+            "extracted_data": patient_data.to_dict(orient="records")[0]
+        }
+
+        # Dodaj komunikat o brakujących danych tylko jeśli jakieś były
+        if missing_cols:
+            response["warning"] = {
+                "message": "Some clinical information was missing. Prediction may be less accurate.",
+                "missing_fields": missing_cols
+            }
+        self.chat_display.insert("end", f"Asystent: {response['extracted_data']}\n\n")
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model prediction failed: {str(e)}")
