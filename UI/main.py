@@ -1,6 +1,6 @@
 import ttkbootstrap as ttk
 
-from InterfaceRendering import BreastCancerApp
+from interface_rendering import BreastCancerApp
 
 if __name__ == "__main__":
 

@@ -6,8 +6,9 @@ import ttkbootstrap as ttk
 import os
 import warnings
 from tkinter import messagebox, simpledialog
-import Values
+import constants
 import pandas as pd
+from pathlib import Path
 
 
 def load_data_file(self, file_path=None):
@@ -17,19 +18,12 @@ def load_data_file(self, file_path=None):
         if not file_path:
             return
 
+        for widget in self.info_frame.winfo_children():
+            widget.destroy()
+
     img = nib.load(file_path)
     self.loaded_image_data = img.get_fdata()  # zapisujemy dane
     shape = self.loaded_image_data.shape
-    spacing = img.header.get_zooms()
-    filename = file_path.split("/")[-1]
-
-    # Info o pliku
-    for widget in self.info_frame.winfo_children():
-        widget.destroy()
-
-    ttk.Label(self.info_frame, text=f"Nazwa pliku: {filename}").pack(anchor="w", padx=10)
-    ttk.Label(self.info_frame, text=f"Wymiary obrazu: {shape}").pack(anchor="w", padx=10)
-    ttk.Label(self.info_frame, text=f"Spacing: {spacing}").pack(anchor="w", padx=10)
 
     # Obraz
     for widget in self.image_display_frame.winfo_children():
@@ -63,11 +57,12 @@ def load_model_file(self, file_path=None):
     self.training_beginning_label.forget()
 
 
-def load_folder(self, extension, load_first_file=False):
+def load_folder(self, extension, folder_path=None):
 
-    folder_path = filedialog.askdirectory()
-    if not folder_path:
-        return
+    if folder_path is None:
+        folder_path = filedialog.askdirectory()
+        if not folder_path:
+            return
 
     folder = os.fsencode(folder_path)
     files = []
@@ -89,15 +84,13 @@ def load_folder(self, extension, load_first_file=False):
 
                 self.selector_label.config(text=f"1 / {len(files)}")
 
-                if load_first_file:
-                    load_data_file(self, files[0])
+                load_data_file(self, files[0])
 
             case ".pkl":
 
                 self.current_model_file_group = files
 
-                if load_first_file:
-                    load_model_file(self, files[0])
+                load_model_file(self, files[0])
 
             case _:
                 warnings.warn("Nieoczekiwane rozszerzenie")
@@ -114,7 +107,7 @@ def browse_patient_data(self):
 
 
 def load_patient_data(self, patient_id):
-    df = pd.read_excel(Values.clinical_and_imaging_info_path, dtype=str).fillna('')
+    df = pd.read_excel(constants.clinical_and_imaging_info_path, dtype=str).fillna('')
 
     df.columns = df.columns.str.strip()
     row = df[df['patient_id'] == patient_id]
@@ -130,6 +123,9 @@ def load_patient_data(self, patient_id):
 
     row_data = row.iloc[0]
 
+    for widget in self.info_frame.winfo_children():
+        widget.destroy()
+
     for col, val in row_data.items():
         col_clean = col.strip()
 
@@ -143,11 +139,15 @@ def load_patient_data(self, patient_id):
         else:
             display_val = val
 
-        ttk.Label(self.info_frame, text=f"{col_clean}: {display_val}").pack(anchor="w", padx=10)
+        ttk.Label(self.info_frame, text=f"{col_clean}: {display_val}", wraplength=300).pack(anchor="w", padx=10)
 
-    patient_images_folder_path = str(Values.images_folder_path) + patient_id
-    if patient_images_folder_path in load_folder(self, ".nii.gz", False):
-        load_data_file(self, patient_images_folder_path)
+    patient_images_folder_path = str(constants.images_folder_path) + "\\" + patient_id
+    images_folder_children = [str(p) for p in Path(constants.images_folder_path).iterdir()]
+    print(patient_images_folder_path, len(images_folder_children), constants.images_folder_path)
+    if patient_images_folder_path in images_folder_children:
+        load_folder(self, ".nii.gz", patient_images_folder_path)
+
+    self.data_beginning_label.forget()
 
 
 def update_slider_value(self, val):
