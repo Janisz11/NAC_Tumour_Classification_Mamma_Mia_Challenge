@@ -4,11 +4,14 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import ttkbootstrap as ttk
 import os
-import warnings
 from tkinter import messagebox, simpledialog
 import constants
 import pandas as pd
 from pathlib import Path
+import requests
+from tkinter import END
+
+API_URL = "http://127.0.0.1:8000/predict_pcr"
 
 
 def load_data_file(self, file_path=None):
@@ -22,16 +25,15 @@ def load_data_file(self, file_path=None):
             widget.destroy()
 
     img = nib.load(file_path)
-    self.loaded_image_data = img.get_fdata()  # zapisujemy dane
+    self.loaded_image_data = img.get_fdata()
     shape = self.loaded_image_data.shape
 
     # Obraz
     for widget in self.image_display_frame.winfo_children():
         widget.destroy()
 
-    self.current_slice = shape[2] // 2  # startowy slice
+    self.current_slice = shape[2] // 2
 
-    # Miejsce na figurę matplotliba
     self.fig, self.ax = plt.subplots(figsize=(3, 3))
     self.image_obj = self.ax.imshow(self.loaded_image_data[:, :, self.current_slice].T, cmap="gray", origin="lower")
     self.ax.axis("off")
@@ -40,21 +42,11 @@ def load_data_file(self, file_path=None):
     self.canvas.draw()
     self.canvas.get_tk_widget().pack()
 
-    # Aktualizujemy zakres suwaka
     self.slider.config(to=shape[2]-1)
     self.slider_value.set(self.current_slice)
     self.slider_value_showcase.config(text=str(self.current_slice))
 
     self.data_beginning_label.forget()
-
-
-def load_model_file(self, file_path=None):
-    if file_path is None:
-        file_path = filedialog.askopenfilename(filetypes=[("Pickle files", "*.pkl")])
-        if not file_path:
-            return
-
-    self.training_beginning_label.forget()
 
 
 def load_folder(self, extension, folder_path=None):
@@ -75,25 +67,12 @@ def load_folder(self, extension, folder_path=None):
 
     if len(files) > 0:
 
-        match extension:
+        self.current_file_group_index = 0
+        self.current_data_file_group = files
 
-            case ".nii.gz":
+        self.selector_label.config(text=f"1 / {len(files)}")
 
-                self.current_file_group_index = 0
-                self.current_data_file_group = files
-
-                self.selector_label.config(text=f"1 / {len(files)}")
-
-                load_data_file(self, files[0])
-
-            case ".pkl":
-
-                self.current_model_file_group = files
-
-                load_model_file(self, files[0])
-
-            case _:
-                warnings.warn("Nieoczekiwane rozszerzenie")
+        load_data_file(self, files[0])
 
         return files
 
@@ -102,7 +81,7 @@ def load_folder(self, extension, folder_path=None):
 
 
 def browse_patient_data(self):
-    patient_id = simpledialog.askstring("ID Pacjenta", "Podaj ID pacjenta, którego dane chcesz przeglądać:")
+    patient_id = simpledialog.askstring("Patient ID", "Input ID of the patient whose data you want to browse.")
     load_patient_data(self, patient_id)
 
 
@@ -113,7 +92,7 @@ def load_patient_data(self, patient_id):
     row = df[df['patient_id'] == patient_id]
 
     if row.empty:
-        ttk.Label(self.info_frame, text="Pacjent nie znaleziony").pack(anchor="w", padx=10)
+        messagebox.showinfo("Patient not found" ,"Patient not found")
         return
 
     binary_cols = {
@@ -143,7 +122,6 @@ def load_patient_data(self, patient_id):
 
     patient_images_folder_path = str(constants.images_folder_path) + "\\" + patient_id
     images_folder_children = [str(p) for p in Path(constants.images_folder_path).iterdir()]
-    print(patient_images_folder_path, len(images_folder_children), constants.images_folder_path)
     if patient_images_folder_path in images_folder_children:
         load_folder(self, ".nii.gz", patient_images_folder_path)
 
@@ -175,3 +153,36 @@ def previous_image(self):
         self.current_file_group_index -= 1
         load_data_file(self, self.current_data_file_group[self.current_file_group_index])
         self.selector_label.config(text=f"{self.current_file_group_index + 1} / {len(self.current_data_file_group)}")
+
+
+def send_request(self):
+    user_text = self.user_input.get().strip()
+    if not user_text:
+        return
+
+    self.chat_display.insert("end", f"TY: {user_text}\n\n")
+
+    self.user_input.delete(0, END)
+
+    payload = {"raw_text": user_text}
+
+    try:
+        response = requests.post(API_URL, json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+        prediction = data.get("prediction", "N/A")
+        extracted = data.get("extracted_data", {})
+        missing = data.get("warning", {}).get("missing_fields", [])
+
+        result = f"Prediction (pCR): {prediction}\n\nExtracted data:\n"
+        for k, v in extracted.items():
+            result += f"{k}: {v}\n"
+
+        if missing:
+            result += f"\n Missing fields: {', '.join(missing)}"
+
+        self.chat_display.insert("end", f"ASYSTENT: {result}\n\n")
+
+    except Exception as e:
+        messagebox.showerror("Error", f"Request failed:\n{str(e)}")
