@@ -13,7 +13,6 @@ def generate_voxelwise_tic_curves(image_stack, mask):
     tic_curves = {}
     I0 = image_stack[0].astype(np.float32) + 1e-8  # pre-contrast
     num_phases = image_stack.shape[0]  # number of phases
-    print(num_phases)
 
     for idx in zip(*np.where(mask > 0)):  # voxel coordinates with tumor (3D)
         curve = []
@@ -37,10 +36,6 @@ def compute_tic_features(tic):
 
     # Rate of contrast uptake
     wash_in_rate = (peak_value - baseline) / (peak_phase_index + eps)
-    print(baseline)
-    print(peak_value)
-    print(peak_phase_index)
-    print(wash_in_rate)
 
     # Degree of contrast wash-out
     wash_out_enhancement = (last_value - peak_value) / (peak_value + eps)
