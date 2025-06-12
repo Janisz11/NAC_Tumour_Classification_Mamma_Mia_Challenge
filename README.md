@@ -83,6 +83,11 @@ Scatter plot showing the relationship between wash-in rate and wash-out enhancem
 ![WashInOut](images_and_visualisations/WashInOut.png)
 
 ## Clinical Data - CSV File
+
+![Test-dataset](images_and_visualisations/Test-Dataset-Table-1.pdf)
+
+![Test-dataset2](images_and_visualisations/Test-Dataset-Table-3.pdf)
+
 ## Technologies Used
 - Python 3.8+
 - numpy – array and math operations
