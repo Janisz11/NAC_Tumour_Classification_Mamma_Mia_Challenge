@@ -1,98 +1,216 @@
-import torch
-from torch.utils.data import DataLoader
-import torch.optim as optim
-import torch.nn.functional as F
-from sklearn.metrics import balanced_accuracy_score
-import pandas as pd
-import csv
+# dataset.py
 import os
+import random
+import torch
+from torch.utils.data import Dataset
+import nibabel as nib
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
 
-from dataset import MammaMiaCompetitionDataset
-from model import FusionPCRNet
+# -----------------------
+# Stałe
+# -----------------------
+TARGET_SHAPE = (128, 128, 128)  # finalny rozmiar po resize
+MAX_PHASES   = 5                # maksymalnie 5 faz DCE-MRI
+MARGIN       = 60               # margines dookoła maski w voxelach
+EPS          = 1e-8
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# -----------------------
+# Normalizacja wspólna dla wszystkich faz pacjenta
+# -----------------------
+def _normalize_stack(phase_list_np):
+    """
+    Z-score dla całego stosu faz: μ i σ liczone z fazy 0,
+    a następnie stosowane do KAŻDEJ fazy.
+    """
+    baseline = phase_list_np[0].astype(np.float32)
+    mu  = baseline.mean()
+    std = baseline.std() + EPS
+    return [(ph.astype(np.float32) - mu) / std for ph in phase_list_np]
 
-# Ścieżki danych
-SRC_ROOT = "/lustre/pd01/hpc-ljelen-1692966897/mamma_mia"
-images_root = f"{SRC_ROOT}/images"
-segmentation_root = f"{SRC_ROOT}/segmentations/expert"
-clinical_xlsx = f"{SRC_ROOT}/clinical_and_imaging_info.xlsx"
-splits_csv = f"{SRC_ROOT}/train_test_splits.csv"
+# -----------------------
+# AUGMENTACJE 3-D
+# -----------------------
+def _augment_volumes(phase_vols_np, mask_np):
+    """
+    Zestaw lekkich augmentacji dla wolumenów + maski.
+    Wszystkie operacje muszą być identyczne na danych i masce.
+    """
+    # --- losowe flipsy wzdłuż osi ---
+    for ax in (0, 1, 2):            # Z, Y, X
+        if random.random() < 0.5:
+            phase_vols_np = [np.flip(v, axis=ax).copy() for v in phase_vols_np]
+            mask_np       = np.flip(mask_np, axis=ax).copy()
 
-splits_df = pd.read_csv(splits_csv).dropna(subset=["train_split", "test_split"])
-clin_df = pd.read_excel(clinical_xlsx).dropna(subset=["pcr"])
-valid_ids = set(clin_df["patient_id"].astype(str))
+    # --- losowa rotacja 90° wokół osi Z (czyli w płaszczyźnie Y-X) ---
+    k = random.randint(0, 3)        # 0,1,2,3 × 90°
+    if k:
+        phase_vols_np = [np.rot90(v, k=k, axes=(1, 2)).copy() for v in phase_vols_np]
+        mask_np       = np.rot90(mask_np, k=k, axes=(1, 2)).copy()
 
-train_patients = [p for p in splits_df["train_split"].unique() if p in valid_ids]
-val_patients   = [p for p in splits_df["test_split"].unique() if p in valid_ids]
+    # --- gaussian noise (p = 0.5) ---
+    if random.random() < 0.5:
+        sigma = 0.02
+        phase_vols_np = [
+            v + np.random.normal(0.0, sigma, size=v.shape).astype(np.float32)
+            for v in phase_vols_np
+        ]
 
-train_dataset = MammaMiaCompetitionDataset(train_patients, images_root, clinical_xlsx, segmentation_root)
-val_dataset   = MammaMiaCompetitionDataset(val_patients, images_root, clinical_xlsx, segmentation_root)
+    # --- losowy shift/scale intensywności ---
+    scale = np.random.normal(loc=1.0, scale=0.05)  # ~N(1,0.05)
+    shift = np.random.normal(loc=0.0, scale=0.05)  # ~N(0,0.05)
+    phase_vols_np = [(v * scale + shift).astype(np.float32) for v in phase_vols_np]
 
-train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=4)
-val_loader   = DataLoader(val_dataset, batch_size=2, num_workers=4)
+    return phase_vols_np, mask_np
 
-model = FusionPCRNet(in_channels=6, tic_dim=4).to(device)
-optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+# -----------------------
+# Pomocnicze funkcje TIC
+# -----------------------
+def _generate_tic_curves(image_stack: np.ndarray, mask: np.ndarray):
+    """Zwraca słownik {voxel_index: [I/I0 w kolejnych fazach]}"""
+    tic_curves = {}
+    I0 = image_stack[0].astype(np.float32) + EPS
+    nz = np.where(mask > 0)
+    for idx in zip(*nz):
+        curve = image_stack[:, idx[0], idx[1], idx[2]] / I0[idx]
+        tic_curves[idx] = curve.tolist()
+    return tic_curves
 
-log_path = "training_log.csv"
-os.makedirs("models", exist_ok=True)
-best_val_acc = 0.0
 
-with open(log_path, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["epoch", "train_loss", "val_loss", "train_bal_acc", "val_bal_acc", "TP", "FP", "TN", "FN"])
+def _compute_voxel_tic_features(tic):
+    tic = np.array(tic, dtype=np.float32)
+    n_phases = len(tic)
+    baseline = tic[0]
+    peak_idx = int(np.argmax(tic))
+    peak_val = tic[peak_idx]
+    last_val = tic[-1]
 
-epochs = 100
-for epoch in range(epochs):
-    model.train()
-    total_train_loss, y_true_train, y_pred_train = 0, [], []
+    wash_in_rate = (peak_val - baseline) / (peak_idx + EPS)
+    wash_out_enh = (last_val - peak_val) / (peak_val + EPS)
 
-    for x, y, feats in train_loader:
-        x, y, feats = x.to(device), y.to(device), feats.to(device)
-        optimizer.zero_grad()
-        logits = model(x, feats)
-        loss = F.cross_entropy(logits, y)
-        loss.backward()
-        optimizer.step()
-        total_train_loss += loss.item()
-        y_true_train += y.cpu().tolist()
-        y_pred_train += logits.argmax(dim=1).cpu().tolist()
+    if peak_idx < n_phases - 1:
+        x = np.arange(peak_idx, n_phases).reshape(-1, 1)
+        y = tic[peak_idx:]
+        mdl = LinearRegression().fit(x, y)
+        y_pred = mdl.predict(x)
+        rss = np.sum((y - y_pred) ** 2)
+        wash_out_stab = rss / ((baseline + EPS) * (n_phases - peak_idx))
+    else:
+        wash_out_stab = 0.0
 
-    train_bal_acc = balanced_accuracy_score(y_true_train, y_pred_train)
-    avg_train_loss = total_train_loss / len(train_loader)
+    return wash_in_rate, wash_out_enh, wash_out_stab
 
-    model.eval()
-    total_val_loss, y_true_val, y_pred_val = 0, [], []
-    with torch.no_grad():
-        for x, y, feats in val_loader:
-            x, y, feats = x.to(device), y.to(device), feats.to(device)
-            logits = model(x, feats)
-            loss = F.cross_entropy(logits, y)
-            total_val_loss += loss.item()
-            y_true_val += y.cpu().tolist()
-            y_pred_val += logits.argmax(dim=1).cpu().tolist()
 
-    val_bal_acc = balanced_accuracy_score(y_true_val, y_pred_val)
-    avg_val_loss = total_val_loss / len(val_loader)
+def _aggregate_tic_features(image_stack: np.ndarray, mask: np.ndarray):
+    """Zwraca tensor [log_voxel_count, avg_wash_in, avg_wash_out_enh, avg_wash_out_stab]"""
+    tic_curves = _generate_tic_curves(image_stack, mask)
+    voxel_count = len(tic_curves)
+    if voxel_count == 0:
+        return torch.zeros(4)
 
-    # Confusion matrix
-    y_true_tensor = torch.tensor(y_true_val)
-    y_pred_tensor = torch.tensor(y_pred_val)
-    TP = int(((y_true_tensor == 1) & (y_pred_tensor == 1)).sum())
-    TN = int(((y_true_tensor == 0) & (y_pred_tensor == 0)).sum())
-    FP = int(((y_true_tensor == 0) & (y_pred_tensor == 1)).sum())
-    FN = int(((y_true_tensor == 1) & (y_pred_tensor == 0)).sum())
+    total_in, total_out, total_stab = 0.0, 0.0, 0.0
+    for tic in tic_curves.values():
+        wi, wo_enh, wo_stab = _compute_voxel_tic_features(tic)
+        total_in   += wi
+        total_out  += wo_enh
+        total_stab += wo_stab
 
-    print(f"Epoka {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-          f"Train BAcc: {train_bal_acc:.4f} | Val BAcc: {val_bal_acc:.4f} | TP: {TP} FP: {FP} TN: {TN} FN: {FN}")
+    avg_wi   = total_in / voxel_count
+    avg_wo_e = total_out / voxel_count
+    avg_wo_s = total_stab / voxel_count
 
-    with open(log_path, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([epoch + 1, avg_train_loss, avg_val_loss, train_bal_acc, val_bal_acc, TP, FP, TN, FN])
+    log_voxel_count = torch.log10(torch.tensor([voxel_count + EPS]))
+    normed_features = torch.tensor([avg_wi, avg_wo_e, avg_wo_s], dtype=torch.float32)
+    return torch.cat([log_voxel_count, normed_features], dim=0)
 
-    if val_bal_acc > best_val_acc:
-        best_val_acc = val_bal_acc
-        torch.save(model.state_dict(), "models/best_model.pth")
-if __name__ == "__main__":
-    torch.multiprocessing.set_start_method("spawn", force=True)
+# -----------------------
+# Dataset
+# -----------------------
+class MammaMiaCompetitionDataset(Dataset):
+    def __init__(self, patient_ids, images_root, clinical_xlsx, segmentation_root):
+        self.patient_ids       = patient_ids
+        self.images_root       = images_root
+        self.segmentation_root = segmentation_root
+        clin_df = pd.read_excel(clinical_xlsx).dropna(subset=["pcr"])
+        self.labels = dict(zip(clin_df["patient_id"], clin_df["pcr"].astype(int)))
+
+    # ---------- utils ----------
+    def _torch_from_np(self, vol_np):
+        return torch.tensor(vol_np[None, ...], dtype=torch.float32)  # [1,D,H,W]
+
+    def _resize(self, vol_t, target_shape):
+        return F.interpolate(
+            vol_t.unsqueeze(0),
+            size=target_shape,
+            mode="trilinear",
+            align_corners=False
+        ).squeeze(0)
+
+    # ---------- main ----------
+    def __len__(self):
+        return len(self.patient_ids)
+
+    def __getitem__(self, idx):
+        pid = self.patient_ids[idx]
+        pid_dir = os.path.join(self.images_root, pid)
+
+        # ---- Wczytanie faz ----
+        phase_paths = sorted(
+            [os.path.join(pid_dir, f) for f in os.listdir(pid_dir) if f.endswith(".nii.gz")]
+        )[:MAX_PHASES]
+
+        phase_vols_np = [
+            nib.load(p).get_fdata().astype(np.float32) for p in phase_paths
+        ]
+        while len(phase_vols_np) < MAX_PHASES:
+            phase_vols_np.append(np.zeros_like(phase_vols_np[0]))
+
+        # ---- Normalizacja wspólna (μ, σ z fazy 0) ----
+        phase_vols_np = _normalize_stack(phase_vols_np)
+
+        # ---- Wczytanie maski ----
+        mask_path = os.path.join(self.segmentation_root, f"{pid}.nii.gz")
+        if not os.path.exists(mask_path):
+            mask_np = np.zeros_like(phase_vols_np[0])
+        else:
+            mask_np = (nib.load(mask_path).get_fdata() > 0).astype(np.uint8)
+
+        # ---- Crop bbox ----
+        nz = np.where(mask_np > 0)
+        if len(nz[0]) > 0:
+            zmin, ymin, xmin = np.min(nz[0]), np.min(nz[1]), np.min(nz[2])
+            zmax, ymax, xmax = np.max(nz[0]), np.max(nz[1]), np.max(nz[2])
+            zmin = max(zmin - MARGIN, 0)
+            ymin = max(ymin - MARGIN, 0)
+            xmin = max(xmin - MARGIN, 0)
+            zmax = min(zmax + MARGIN + 1, mask_np.shape[0])
+            ymax = min(ymax + MARGIN + 1, mask_np.shape[1])
+            xmax = min(xmax + MARGIN + 1, mask_np.shape[2])
+
+            phase_vols_np = [v[zmin:zmax, ymin:ymax, xmin:xmax] for v in phase_vols_np]
+            mask_np       = mask_np[zmin:zmax, ymin:ymax, xmin:xmax]
+
+        # ---- TIC FEATURES (na oryginalnych, bez augment intensywności) ----
+        image_stack_np = np.stack(phase_vols_np, axis=0)  # [T,D,H,W]
+        tic_features   = _aggregate_tic_features(image_stack_np, mask_np)  # tensor(4,)
+
+        # ---- AUGMENTACJE ----
+        phase_vols_np, mask_np = _augment_volumes(phase_vols_np, mask_np)
+
+        # ---- Konwersja do torch & resize ----
+        phase_vols_t = [self._torch_from_np(v) for v in phase_vols_np]
+        mask_t       = self._torch_from_np(mask_np.astype(np.float32))
+
+        phase_vols_t = [self._resize(v, TARGET_SHAPE) for v in phase_vols_t]
+        mask_t       = self._resize(mask_t, TARGET_SHAPE)
+
+        while len(phase_vols_t) < MAX_PHASES:
+            phase_vols_t.append(torch.zeros((1, *TARGET_SHAPE)))
+
+        x_img = torch.cat(phase_vols_t, dim=0)  # [MAX_PHASES,D,H,W]
+        x     = torch.cat([x_img, mask_t], dim=0)  # +1 kanał maski
+
+        y = torch.tensor(self.labels[pid], dtype=torch.long)
+        return x, y, tic_features

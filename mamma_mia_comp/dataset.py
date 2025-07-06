@@ -1,5 +1,6 @@
 # dataset.py
 import os
+import random
 import torch
 from torch.utils.data import Dataset
 import nibabel as nib
@@ -8,11 +9,13 @@ import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
 
+# -----------------------
+# Stałe
+# -----------------------
 TARGET_SHAPE = (128, 128, 128)  # finalny rozmiar po resize
-MAX_PHASES = 5  # maksymalnie 5 faz DCE-MRI
-MARGIN = 10  # margines dookoła maski w voxelach
-EPS = 1e-8
-
+MAX_PHASES   = 5                # maksymalnie 5 faz DCE-MRI
+MARGIN       = 60               # margines dookoła maski w voxelach
+EPS          = 1e-8
 
 # -----------------------
 # Normalizacja wspólna dla wszystkich faz pacjenta
@@ -23,10 +26,44 @@ def _normalize_stack(phase_list_np):
     a następnie stosowane do KAŻDEJ fazy.
     """
     baseline = phase_list_np[0].astype(np.float32)
-    mu = baseline.mean()
+    mu  = baseline.mean()
     std = baseline.std() + EPS
     return [(ph.astype(np.float32) - mu) / std for ph in phase_list_np]
 
+# -----------------------
+# AUGMENTACJE 3-D
+# -----------------------
+def _augment_volumes(phase_vols_np, mask_np):
+    """
+    Zestaw lekkich augmentacji dla wolumenów + maski.
+    Wszystkie operacje muszą być identyczne na danych i masce.
+    """
+    # --- losowe flipsy wzdłuż osi ---
+    for ax in (0, 1, 2):            # Z, Y, X
+        if random.random() < 0.5:
+            phase_vols_np = [np.flip(v, axis=ax).copy() for v in phase_vols_np]
+            mask_np       = np.flip(mask_np, axis=ax).copy()
+
+    # --- losowa rotacja 90° wokół osi Z (czyli w płaszczyźnie Y-X) ---
+    k = random.randint(0, 3)        # 0,1,2,3 × 90°
+    if k:
+        phase_vols_np = [np.rot90(v, k=k, axes=(1, 2)).copy() for v in phase_vols_np]
+        mask_np       = np.rot90(mask_np, k=k, axes=(1, 2)).copy()
+
+    # --- gaussian noise (p = 0.5) ---
+    if random.random() < 0.5:
+        sigma = 0.02
+        phase_vols_np = [
+            v + np.random.normal(0.0, sigma, size=v.shape).astype(np.float32)
+            for v in phase_vols_np
+        ]
+
+    # --- losowy shift/scale intensywności ---
+    scale = np.random.normal(loc=1.0, scale=0.05)  # ~N(1,0.05)
+    shift = np.random.normal(loc=0.0, scale=0.05)  # ~N(0,0.05)
+    phase_vols_np = [(v * scale + shift).astype(np.float32) for v in phase_vols_np]
+
+    return phase_vols_np, mask_np
 
 # -----------------------
 # Pomocnicze funkcje TIC
@@ -76,11 +113,11 @@ def _aggregate_tic_features(image_stack: np.ndarray, mask: np.ndarray):
     total_in, total_out, total_stab = 0.0, 0.0, 0.0
     for tic in tic_curves.values():
         wi, wo_enh, wo_stab = _compute_voxel_tic_features(tic)
-        total_in += wi
-        total_out += wo_enh
+        total_in   += wi
+        total_out  += wo_enh
         total_stab += wo_stab
 
-    avg_wi = total_in / voxel_count
+    avg_wi   = total_in / voxel_count
     avg_wo_e = total_out / voxel_count
     avg_wo_s = total_stab / voxel_count
 
@@ -88,14 +125,13 @@ def _aggregate_tic_features(image_stack: np.ndarray, mask: np.ndarray):
     normed_features = torch.tensor([avg_wi, avg_wo_e, avg_wo_s], dtype=torch.float32)
     return torch.cat([log_voxel_count, normed_features], dim=0)
 
-
 # -----------------------
 # Dataset
 # -----------------------
 class MammaMiaCompetitionDataset(Dataset):
     def __init__(self, patient_ids, images_root, clinical_xlsx, segmentation_root):
-        self.patient_ids = patient_ids
-        self.images_root = images_root
+        self.patient_ids       = patient_ids
+        self.images_root       = images_root
         self.segmentation_root = segmentation_root
         clin_df = pd.read_excel(clinical_xlsx).dropna(subset=["pcr"])
         self.labels = dict(zip(clin_df["patient_id"], clin_df["pcr"].astype(int)))
@@ -154,22 +190,27 @@ class MammaMiaCompetitionDataset(Dataset):
             xmax = min(xmax + MARGIN + 1, mask_np.shape[2])
 
             phase_vols_np = [v[zmin:zmax, ymin:ymax, xmin:xmax] for v in phase_vols_np]
-            mask_np = mask_np[zmin:zmax, ymin:ymax, xmin:xmax]
+            mask_np       = mask_np[zmin:zmax, ymin:ymax, xmin:xmax]
 
+        # ---- TIC FEATURES (na oryginalnych, bez augment intensywności) ----
         image_stack_np = np.stack(phase_vols_np, axis=0)  # [T,D,H,W]
-        tic_features = _aggregate_tic_features(image_stack_np, mask_np)  # tensor(4,)
+        tic_features   = _aggregate_tic_features(image_stack_np, mask_np)  # tensor(4,)
 
+        # ---- AUGMENTACJE ----
+        phase_vols_np, mask_np = _augment_volumes(phase_vols_np, mask_np)
+
+        # ---- Konwersja do torch & resize ----
         phase_vols_t = [self._torch_from_np(v) for v in phase_vols_np]
-        mask_t = self._torch_from_np(mask_np.astype(np.float32))
+        mask_t       = self._torch_from_np(mask_np.astype(np.float32))
 
         phase_vols_t = [self._resize(v, TARGET_SHAPE) for v in phase_vols_t]
-        mask_t = self._resize(mask_t, TARGET_SHAPE)
+        mask_t       = self._resize(mask_t, TARGET_SHAPE)
 
         while len(phase_vols_t) < MAX_PHASES:
             phase_vols_t.append(torch.zeros((1, *TARGET_SHAPE)))
 
         x_img = torch.cat(phase_vols_t, dim=0)  # [MAX_PHASES,D,H,W]
-        x = torch.cat([x_img, mask_t], dim=0)  # +1 kanał maski
+        x     = torch.cat([x_img, mask_t], dim=0)  # +1 kanał maski
 
         y = torch.tensor(self.labels[pid], dtype=torch.long)
         return x, y, tic_features
